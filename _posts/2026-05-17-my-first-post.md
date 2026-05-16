@@ -1,7 +1,9 @@
+---
 title: My First Post
-date: 2026-05-17 01:10:10 + 0800
+date: 2026-05-17 01:10:10 +0800
 categories: [Tech]
 tags: [life]
+---
 
 # The first post
 
