@@ -7,7 +7,7 @@ tags: [Stack-Borrows]
 
 # Stack Borrows
 
-这篇Post主要分享学习Stack-Borrows的过程和感悟。如果有问题和疑问，欢迎指出。
+这篇Post主要分享学习Stack-Borrows的过程和感悟。关于Stack-Borrows的实现和内容，主要从这篇Blog中学到：[Stack-Borrows](https://github.com/rust-lang/unsafe-code-guidelines/blob/master/wip/stacked-borrows.md)。如果有问题和疑问，欢迎指出。
 
 ## Reason
 
@@ -33,7 +33,7 @@ pub const unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize)
 
 但是当时我不理解 `dst` 为什么会被 `src读` 失效，问了AI后，用一些代码在rustplayground上跑，下面是第一段代码：
 
-```rust title="code1"
+```rust"
 fn main() {
     let mut arr = [10, 20, 30, 40];
 
@@ -75,6 +75,8 @@ help: <385> was later invalidated at offsets [0x0..0x10] by a Unique retag
    |                              ^^^
 ```
 
+## Stack-Borrows
+
 在写这篇post的时候，我已经阅读了一些Stack-Borrows的文档，在zulip上也open了一个关于这个API的[讨论](https://rust-lang.zulipchat.com/#narrow/channel/136281-t-opsem/topic/Different.20output.20when.20testing.20std.3A.3Aptr.3A.3Acopy.20by.20miri/with/595183915)，对于这个UB出现的原因，以及“invalidate”的含义，都大概了解了。
 
 首先需要介绍一下Stack-Borrows是什么。Stack-Borrows是一个Aliasing模型。Aliasing就是别名关系，如果一个内存区域，有多个指针或者有多个引用同时指向这个内存，那么可以说他们具有Alias关系。[The Rustonomicon](https://doc.rust-lang.org/nomicon/aliasing.html)和[Rust By Example](https://doc.rust-lang.org/rust-by-example/scope/borrow/alias.html)中有介绍Aliasing的章节。在Rust中，Aliasing主要有下面的要求：
@@ -85,9 +87,53 @@ help: <385> was later invalidated at offsets [0x0..0x10] by a Unique retag
 
 下面来解释一下为什么上面的例子在使用Stack-Borrows时会检测到UB。
 
-Stack-Borrows会在创建新引用或者新的裸指针时，分配出一个唯一性的Tag（通过递增实现唯一性）。但是Tag具有不同的许可(Permission)，[github](https://github.com/rust-lang/unsafe-code-guidelines/blob/master/wip/stacked-borrows.md#extra-state)上给出了Stack-Borrows中Tag许可的四种分类：Unique(&mut T)，SharedReadWrite(内部可变性类型以及裸指针)，SharedReadOnly(&T)和Disabled(失去读写权限，可以作为标志位，通常由在栈中的Tag进行的读操作引起)。对于一个内存区域，其相关的裸指针以及引用都通过一个栈来记录活跃的Tag，创建一个新的Tag就会push到栈中，在生命周期结束时就会pop出栈。但是在进栈时，会根据Tag的Permission有额外的处理：如果一个Unique的Tag进栈，那么在栈中所有已有的Tag都会Pop出栈，因此被称为“invalidate”。
+Stack-Borrows会在创建新引用或者新的裸指针时，分配出一个唯一性的Tag（通过递增实现唯一性），通过引用创建引用或者指针时，会基于当前Tag创建出新的Tag，这个过程叫重新标记(ReTag)。ReTag的场景有以下几种，每一种场景都有各自ReTag的类型：
+
+1. 普通的赋值操作之后.只把一个引用（& / &mut）或者 Box 赋值给另一个变量，Stack-Borrows就会给新变量来一次 Default 或 TwoPhase 的 Retag。
+2. 引用变成裸指针时：写下类似 &mut x as *mut i32 的强制转换时，会进行一次 Raw Retag。
+3. 函数入口：每个函数刚开始执行的第一条指令，会对它接收到的所有参数进行一次 FnEntry Retag。
+4. 接收函数返回值时：调用函数并传递它返回的引用时，该引用会经历一次 Default Retag。
+5. 变量被 Drop 销毁时：当变量离开作用域触发自动清理逻辑时，会把传入的参数当作裸指针，进行一次 Raw Retag 。
+
+Tag具有不同的许可(Permission)，[github](https://github.com/rust-lang/unsafe-code-guidelines/blob/master/wip/stacked-borrows.md#extra-state)上给出了Stack-Borrows中许可的四种分类：Unique(&mut T)，SharedReadWrite(内部可变性类型以及裸指针)，SharedReadOnly(&T)和Disabled(失去读写权限，可以作为标志位，通常由在栈中的Tag进行的读操作引起)。对于一个内存区域，其相关的裸指针以及引用都通过一个栈来记录活跃的Tag，创建一个新的Tag就会push到栈中，在生命周期结束时就会pop出栈(栈中真正存储的应该叫作Item，Tag其实只是地址，一个Item拥有Tag、许可和Protector，Protector用于作为函数参数时保护参数)。但是在进栈时，会根据Tag的Permission有额外的处理：如果一个Unique的Tag进栈，那么在栈中所有已有的Tag都会Pop出栈，因此被称为“invalidate”。
 
 可以推测原因：一个可变引用被创建，那么不允许存在任何不可变引用以及派生。这个规则导致了在第七行创建dst_slice时，base_ptr就不能再被用于内存读取，因为对应的Tag已经不在栈中。这对应了UB的第一行报错: `attempting a read access using <385> at alloc201[0x0], but that tag does not exist in the borrow stack for this location`
+
+但是Stack-Borrows只有上面的设计，在遇到 **Two-Phase-Borrows** 时会出现问题:
+
+```rust
+fn two_phase() {
+    let mut v = vec![];
+    v.push(v.len());
+}
+```
+
+上面的代码使用刚才提到的设计就会触发UB，因为`v.push()`先运行，Stack-Borrows发现存在一个可变引用的使用，在栈中push一个Unique Tag。但是作为参数,`v.len()`会在`v.push()`调用后继续运行，`v.len()`运行结束之后再回到`v.push()`中。在运行`v.len()`时发现目前有一个可变引用的Tag已经在栈中，而`v.len()`使用的是不可变引用，两者不能同时存在。
+
+为了解决这个问题，Stack-Borrows设计了新的机制。在可变引用创建时，会判断这个可变引用是否是Two-Phase-Borrows：
+
+```rust
+pub enum RefKind {
+    /// `&mut` and `Box`.
+    Unique { two_phase: bool },
+    /// `&` with or without interior mutability.
+    Shared,
+    /// `*mut`/`*const` (raw pointers).
+    Raw { mutable: bool },
+}
+
+fn reborrow(
+    self: &mut MiriInterpContext,
+    place: MPlaceTy<Tag>,
+    kind: RefKind,
+    new_tag: Tag,
+    protect: Option<ProtectorKind>,
+)
+```
+
+如果是用于Two-Phase-Borrows，那么这个Tag进栈时不会将所有的Tag弹出栈，也不会禁止之后的不可变引用，类似Two-Phase-Borrows的Frozen阶段。上面的例子中，`v.len()`重新借用产生的不可变引用可以正常使用。当`v.len()`结束，`v.push()`真正运行时，这个Tag才会将已有的不可变引用弹出栈，不允许通过其他引用进行任何读取，类似Two-Phase-Borrows的Active阶段。
+
+## Tree-Borrows
 
 神奇的是，上述例子使用Tree-Borrows再次运行，并不会检测出UB。
 
