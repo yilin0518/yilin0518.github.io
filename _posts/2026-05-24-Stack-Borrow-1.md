@@ -33,7 +33,7 @@ pub const unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize)
 
 但是当时我不理解 `dst` 为什么会被 `src读` 失效，问了AI后，用一些代码在rustplayground上跑，下面是第一段代码：
 
-```rust"
+```rust
 fn main() {
     let mut arr = [10, 20, 30, 40];
 
